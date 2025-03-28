@@ -18,12 +18,14 @@ from pydantic import BaseModel, Field
 
 from uagents import Agent, Context, Model, Protocol
 
+from threading import Lock
 
 # Flag to track if the cleanup handler is registered
 _CLEANUP_HANDLER_REGISTERED = False
 
 # Dictionary to keep track of all running uAgents
 RUNNING_UAGENTS = {}
+RUNNING_UAGENTS_LOCK = Lock()
 
 # Define message models for communication
 class QueryMessage(Model):
@@ -119,25 +121,43 @@ def create_text_chat(text: str) -> ChatMessage:
         content=[TextContent(type="text", text=text)],
     )
 
+def create_end_session_chat() -> ChatMessage:
+    return ChatMessage(
+        timestamp=datetime.utcnow(),
+        msg_id=uuid4(),
+        content=[EndSessionContent(type="end-session")],
+    )
+
+
+class StructuredOutputPrompt(Model):
+    prompt: str
+    output_schema: dict[str, Any]
+
+
+class StructuredOutputResponse(Model):
+    output: dict[str, Any]
+
 # Protocol definitions
-chat_proto = Protocol(name="AgentChatProtcol", version="0.2.1")
+chat_proto = Protocol(name="AgentChatProtocol", version="0.2.1")
 struct_output_client_proto = Protocol(name="StructuredOutputClientProtocol", version="0.1.0")
+
+
 
 # Cleanup functions for uAgents
 def cleanup_uagent(agent_name):
     """Stop a specific uAgent"""
-    if agent_name in RUNNING_UAGENTS:
-        # Currently there's no direct way to stop a uAgent
-        # The thread will exit when the main program exits
-        print(f"Marked agent '{agent_name}' for cleanup")
-        del RUNNING_UAGENTS[agent_name]
-        return True
+    with RUNNING_UAGENTS_LOCK:
+        if agent_name in RUNNING_UAGENTS:
+            print(f"Marked agent '{agent_name}' for cleanup")
+            del RUNNING_UAGENTS[agent_name]
+            return True
     return False
 
 def cleanup_all_uagents():
     """Stop all uAgents"""
-    for agent_name in list(RUNNING_UAGENTS.keys()):
-        cleanup_uagent(agent_name)
+    with RUNNING_UAGENTS_LOCK:
+        for agent_name in list(RUNNING_UAGENTS.keys()):
+            cleanup_uagent(agent_name)
 
 class UAgentRegisterToolInput(BaseModel):
     """Input schema for UAgentRegister tool."""
@@ -146,6 +166,7 @@ class UAgentRegisterToolInput(BaseModel):
     port: int = Field(..., description="Port to run on (defaults to a random port between 8000-9000)")
     description: str = Field(..., description="Description of the agent")
     api_token: Optional[str] = Field(None, description="API token for agentverse.ai")
+    ai_agent_address: Optional[str] = Field(None, description="Address of the AI agent to forward messages to")
 
 
 class UAgentRegisterTool(BaseTool):
@@ -174,16 +195,7 @@ class UAgentRegisterTool(BaseTool):
             _CLEANUP_HANDLER_REGISTERED = True
     
     def _find_available_port(self, preferred_port=None, start_range=8000, end_range=9000):
-        """Find an available port to use for the agent.
-        
-        Args:
-            preferred_port: Try this port first if provided
-            start_range: Start of port range to search
-            end_range: End of port range to search
-            
-        Returns:
-            An available port number
-        """
+        """Find an available port to use for the agent."""
         # Try the preferred port first
         if preferred_port is not None:
             try:
@@ -191,8 +203,7 @@ class UAgentRegisterTool(BaseTool):
                     s.bind(('', preferred_port))
                     return preferred_port
             except OSError:
-                # Port is in use, continue to the range search
-                pass
+                print(f"Preferred port {preferred_port} is in use, searching for alternative...")
         
         # Search for an available port in the range
         for port in range(start_range, end_range):
@@ -202,16 +213,11 @@ class UAgentRegisterTool(BaseTool):
                     return port
             except OSError:
                 continue
-                
-        # If we can't find an available port, use the preferred port anyway
-        # and let the agent creation handle any conflicts
-        if preferred_port is not None:
-            return preferred_port
-        else:
-            # Return a port in the middle of the range and hope for the best
-            return (start_range + end_range) // 2
+        
+        # If we can't find an available port, raise an exception
+        raise RuntimeError(f"Could not find an available port in range {start_range}-{end_range}")
     
-    def _langchain_to_uagent(self, agent_obj, agent_name, port, description=None):
+    def _langchain_to_uagent(self, agent_obj, agent_name, port, description=None, ai_agent_address=None):
         """Convert a Langchain agent to a uAgent."""
         # Create the agent
         uagent = Agent(
@@ -221,18 +227,26 @@ class UAgentRegisterTool(BaseTool):
             mailbox=True
         )
         
+        # Get AI agent address from environment if not provided
+        if ai_agent_address is None:
+            ai_agent_address = os.getenv("AI_AGENT_ADDRESS")
+            if not ai_agent_address:
+                print("Warning: No AI agent address provided. Message forwarding will be disabled.")
+        
         # Store the agent for later cleanup
         agent_info = {
             "name": agent_name,
             "uagent": uagent,
             "port": port,
-            "agent_obj": agent_obj
+            "agent_obj": agent_obj,
+            "ai_agent_address": ai_agent_address
         }
         
         if description is not None:
             agent_info["description"] = description
         
-        RUNNING_UAGENTS[agent_name] = agent_info
+        with RUNNING_UAGENTS_LOCK:
+            RUNNING_UAGENTS[agent_name] = agent_info
         
         # Define startup handler to show agent address
         @uagent.on_event("startup")
@@ -278,26 +292,119 @@ class UAgentRegisterTool(BaseTool):
                 ))
         
         # Chat protocol handlers
+
         @chat_proto.on_message(ChatMessage)
         async def handle_message(ctx: Context, sender: str, msg: ChatMessage):
-            ctx.logger.info(f"Got a message from {sender}: {msg.content[0].text}")
-            ctx.storage.set(str(ctx.session), sender)
-            await ctx.send(
-                sender,
-                ChatAcknowledgement(timestamp=datetime.utcnow(), acknowledged_msg_id=msg.msg_id),
-            )
+            try:
+                # Log the message type instead of trying to access text directly
+                ctx.logger.info(f"Got a message from {sender}: {type(msg.content[0]).__name__}")
+                ctx.storage.set(str(ctx.session), sender)
+                await ctx.send(
+                    sender,
+                    ChatAcknowledgement(timestamp=datetime.utcnow(), acknowledged_msg_id=msg.msg_id),
+                )
 
-            completion = agent_info['agent_obj'].run(msg.content[0].text)
-
-            await ctx.send(sender, create_text_chat(completion))
+                for item in msg.content:
+                    if isinstance(item, StartSessionContent):
+                        ctx.logger.info(f"Got a start session message from {sender}")
+                        continue
+                    elif isinstance(item, TextContent):
+                        ctx.logger.info(f"Got a text message from {sender}: {item.text}")
+                        ctx.storage.set(str(ctx.session), sender)
+                        
+                        # Get AI agent address from agent info
+                        ai_agent_address = agent_info.get("ai_agent_address")
+                        if not ai_agent_address:
+                            ctx.logger.warning("No AI agent address configured, skipping message forwarding")
+                            # Instead of skipping, try to process the message directly
+                            try:
+                                # Try to run the agent directly (synchronous)
+                                result = agent_info["agent_obj"].invoke(item.text)
+                                await ctx.send(
+                                    sender,
+                                    create_text_chat(str(result))
+                                )
+                            except Exception as e:
+                                ctx.logger.error(f"Error running agent: {str(e)}")
+                                await ctx.send(
+                                    sender,
+                                    create_text_chat(f"Error: {str(e)}")
+                                )
+                            continue
+                            
+                        await ctx.send(
+                            ai_agent_address,
+                            StructuredOutputPrompt(
+                                prompt=item.text, output_schema=QueryMessage.schema()
+                            ),
+                        )
+                    elif isinstance(item, EndSessionContent):
+                        ctx.logger.info(f"Got an end session message from {sender}")
+                        continue
+                    else:
+                        ctx.logger.info(f"Got unexpected content type from {sender}: {type(item).__name__}")
+            except Exception as e:
+                ctx.logger.error(f"Error handling message: {str(e)}")
+                await ctx.send(
+                    sender,
+                    ResponseMessage(response=f"Error processing message: {str(e)}")
+                )
 
         @chat_proto.on_message(ChatAcknowledgement)
         async def handle_ack(ctx: Context, sender: str, msg: ChatAcknowledgement):
             ctx.logger.info(f"Got an acknowledgement from {sender} for {msg.acknowledged_msg_id}")
         
+
+        @struct_output_client_proto.on_message(StructuredOutputResponse)
+        async def handle_structured_output_response(
+            ctx: Context, sender: str, msg: StructuredOutputResponse
+        ):
+            try:
+                session_sender = ctx.storage.get(str(ctx.session))
+                if session_sender is None:
+                    ctx.logger.error("No session sender found in storage")
+                    return
+
+                # Parse the response into a QueryMessage
+                query = QueryMessage.parse_obj(msg.output)
+                
+                # Get the agent from agent_info
+                agent = agent_info.get("agent_obj")
+                if not agent:
+                    ctx.logger.error("No agent found in agent_info")
+                    await ctx.send(
+                        session_sender,
+                        create_text_chat("Error: Agent not found")
+                    )
+                    return
+
+                # Run the agent with the query (synchronous)
+                try:
+                    result = agent.invoke(query.query)
+                    await ctx.send(
+                        session_sender,
+                        create_text_chat(str(result))
+                    )
+                except Exception as e:
+                    ctx.logger.error(f"Error running agent: {str(e)}")
+                    await ctx.send(
+                        session_sender,
+                        create_text_chat(f"Error: {str(e)}")
+                    )
+                finally:
+                    # End the session
+                    await ctx.send(session_sender, create_end_session_chat())
+                    
+            except Exception as e:
+                ctx.logger.error(f"Error handling structured output: {str(e)}")
+                if session_sender:
+                    await ctx.send(
+                        session_sender,
+                        create_text_chat(f"Error processing response: {str(e)}")
+                    )
         # Include the protocols
         uagent.include(chat_proto, publish_manifest=True)
-        
+        uagent.include(struct_output_client_proto, publish_manifest=True)
         return agent_info
     
     def _start_uagent_in_thread(self, agent_info):
@@ -418,6 +525,7 @@ class ResponseMessage(Model):
         port: int,
         description: str,
         api_token: Optional[str] = None,
+        ai_agent_address: Optional[str] = None,
         *,
         run_manager: Optional[CallbackManagerForToolRun] = None,
         return_dict: bool = False
@@ -430,6 +538,7 @@ class ResponseMessage(Model):
             port: Port to run the uAgent on
             description: Description of the agent
             api_token: Optional API token for agentverse.ai
+            ai_agent_address: Optional address of the AI agent to forward messages to
             run_manager: Optional callback manager
             return_dict: If True, returns the agent_info dictionary directly
             
@@ -439,12 +548,22 @@ class ResponseMessage(Model):
         # Special handling for test environments
         if agent_obj == 'langchain_agent_object':
             # This is a test case, just create a mock agent info object
+            try:
+                actual_port = self._find_available_port(preferred_port=port)
+                if actual_port != port:
+                    print(f"Port {port} is already in use. Using alternative port {actual_port} instead.")
+                    port = actual_port
+            except Exception as e:
+                print(f"Error finding available port: {str(e)}")
+                raise
+
             agent_info = {
                 "name": name,
                 "port": port,
                 "agent_obj": agent_obj,
                 "address": f"agent1{''.join([str(i) for i in range(10)])}xxxxxx",
-                "test_mode": True
+                "test_mode": True,
+                "ai_agent_address": ai_agent_address
             }
             
             if description is not None:
@@ -454,7 +573,8 @@ class ResponseMessage(Model):
                 agent_info["api_token"] = api_token
             
             # Store in running agents
-            RUNNING_UAGENTS[name] = agent_info
+            with RUNNING_UAGENTS_LOCK:
+                RUNNING_UAGENTS[name] = agent_info
             
             # Store current agent info
             self._current_agent_info = agent_info
@@ -475,10 +595,10 @@ class ResponseMessage(Model):
                 port = actual_port
         except Exception as e:
             print(f"Error finding available port: {str(e)}")
-            # Continue with requested port and let the agent creation handle any port conflicts
+            raise
         
         # Create the uAgent
-        agent_info = self._langchain_to_uagent(agent_obj, name, port, description)
+        agent_info = self._langchain_to_uagent(agent_obj, name, port, description, ai_agent_address)
         
         # Store description and API token in agent_info
         if description is not None:
@@ -501,7 +621,7 @@ class ResponseMessage(Model):
         if return_dict:
             return agent_info
         
-        result_str = f"Created test uAgent '{name}' with address {agent_info.get('address', 'unknown')} on port {port}"
+        result_str = f"Created uAgent '{name}' with address {agent_info.get('address', 'unknown')} on port {port}"
         agent_info["result_str"] = result_str
         return agent_info
     
@@ -512,6 +632,7 @@ class ResponseMessage(Model):
         port: int,
         description: str,
         api_token: Optional[str] = None,
+        ai_agent_address: Optional[str] = None,
         *,
         run_manager: Optional[CallbackManagerForToolRun] = None,
     ) -> Dict[str, Any]:
@@ -522,5 +643,6 @@ class ResponseMessage(Model):
             port=port,
             description=description,
             api_token=api_token,
+            ai_agent_address=ai_agent_address,
             run_manager=run_manager
         ) 

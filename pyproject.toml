@@ -29,4 +29,13 @@ optional = true
 pytest = "^8.3.5"
 pytest-socket = "^0.7.0"
 pytest-asyncio = "^0.26.0"
-langchain-tests = "0.3.16" 
+langchain-tests = "0.3.16"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
+asyncio_default_test_loop_scope = "function"
+filterwarnings = [
+    "ignore::DeprecationWarning:pydantic.*",
+    "ignore::DeprecationWarning:google.*"
+] 
